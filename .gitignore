@@ -1,0 +1,9 @@
+qa-media/
+node_modules/
+*.zip
+*.chatdb
+*.db
+*.sqlite*
+*.ipa
+.env*
+.DS_Store
