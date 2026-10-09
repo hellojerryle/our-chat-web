@@ -1,7 +1,7 @@
 'use strict';
 const SHELL_SCOPE = new URL(self.registration.scope);
 const CACHE_PREFIX = `our-chat-shell:${encodeURIComponent(SHELL_SCOPE.href)}:`;
-const SHELL_CACHE = `${CACHE_PREFIX}v6`;
+const SHELL_CACHE = `${CACHE_PREFIX}v7`;
 const SHELL_FILES = ['./', './index.html', './styles.css', './media.js', './app.js', './manifest.webmanifest', './icon.svg', './icon-180.png', './icon-192.png', './icon-512.png'];
 const SHELL_PATHS = new Set(SHELL_FILES.map(file => new URL(file, SHELL_SCOPE).pathname));
 

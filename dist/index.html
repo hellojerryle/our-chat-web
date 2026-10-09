@@ -92,6 +92,7 @@
     <label class="file-zone" id="media-file-zone"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 5v15m-6-6 6 6 6-6M5 22v5h22v-5"/></svg><strong>选择媒体包</strong><span>ZIP_STORED 格式 · 支持多选</span><input id="media-files" type="file" accept=".zip,application/zip" multiple></label><progress id="media-progress" max="100" value="0" hidden></progress><p class="import-status" id="media-status" role="status">请先导入与媒体包对应的聊天 JSON。</p><p class="storage-copy" id="media-space"></p><button id="cancel-media" class="secondary-button" hidden>取消本次导入</button><p class="local-note">已完成的附件会保留；媒体包请留作备份</p>
   </dialog>
   <dialog id="image-dialog" class="image-dialog" aria-label="查看聊天图片"><button id="close-image" class="image-close" aria-label="关闭图片">×</button><img id="full-image" alt="聊天图片"></dialog>
+  <dialog id="video-dialog" class="image-dialog video-dialog" aria-label="预览聊天视频"><button id="close-video" class="image-close" aria-label="关闭视频">×</button><video id="full-video" controls playsinline preload="none"></video><p id="video-preview-status" class="video-preview-status" role="status" hidden></p></dialog>
   <div id="toast" class="toast" role="status" hidden></div>
   <script src="./media.js" defer></script><script src="./app.js" defer></script>
 </body>

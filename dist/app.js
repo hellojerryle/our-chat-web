@@ -6,6 +6,8 @@
   const MAX_FILE_SIZE = 150 * 1024 * 1024;
   const DB_NAME = 'our-chat-private-v1';
   const DATA_URL_PATTERN = /^data:(image\/(?:png|jpeg|jpg|gif|webp|avif)|audio\/(?:mpeg|mp3|wav|x-wav|ogg|mp4|aac|webm|flac|x-m4a)|video\/(?:mp4|webm|quicktime)|application\/[A-Za-z0-9][A-Za-z0-9.+-]{0,127}|text\/plain);base64,[A-Za-z0-9+/\s]*={0,2}$/;
+  const MEDIA_TYPES = new Set(['image','audio','video','file']);
+  const OLD_MEDIA_PLACEHOLDER = /^(?:\[(?:图片|语音|音频|视频|文件|表情)\]\s*)?[（(]?(?:图片|语音|音频|视频|文件|表情)?附件(?:尚)?未导入[）)]?$/;
   const EXAMPLE = {
     schemaVersion: 1, title: '我们的聊天',
     participants: {husband: {name: '我的先生', avatar: ''}, wife: {name: '另一半', avatar: ''}},
@@ -47,6 +49,8 @@
   const mediaUrls = new Set();
   let mediaQueue = [];
   let mediaImportController = null;
+  let videoPreviewError = null;
+  let videoPreviewUrl = '';
   const mediaStore = OurChatMedia.createIndexedDBStore(openDatabase);
   const importMediaPack = OurChatMedia.createImporter(mediaStore);
   const recordsChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('our-chat-records') : null;
@@ -141,8 +145,11 @@
     renderVersion++;
     mediaQueue = [];
     for (const media of document.querySelectorAll('audio,video')) { media.pause(); media.removeAttribute('src'); media.load(); }
-    for (const image of document.querySelectorAll('.message-image')) image.removeAttribute('src');
+    for (const image of document.querySelectorAll('.message-image,.search-media-thumb')) image.removeAttribute('src');
     if ($('image-dialog').open) $('image-dialog').close();
+    $('full-image').removeAttribute('src');
+    if ($('video-dialog').open) $('video-dialog').close();
+    closeVideoPreview();
     for (const url of mediaUrls) URL.revokeObjectURL(url);
     mediaUrls.clear();
   }
@@ -172,7 +179,7 @@
     if (!message) return '还没有消息，导入后就能开始翻看';
     if (message.type === 'file') return `[文件] ${message.fileName}`;
     const labels = {image:'[图片]', audio:'[语音]', video:'[视频]', system:'[提示]'};
-    return message.text || labels[message.type] || '';
+    return mediaCaption(message) || labels[message.type] || '';
   }
   function refreshOverview() {
     ensureIndexes();
@@ -233,7 +240,7 @@
   }
   function showView(view, options = {}) {
     if (currentView === 'chat') chatScrollTop = $('message-list').scrollTop;
-    if (view !== 'search') searchGeneration++;
+    if (view !== 'search') { searchGeneration++; clearTimeout(searchTimer); }
     releaseMediaUrls(); currentView = view;
     for (const name of ['list','chat','settings','details','search','calendar']) {
       const section = $(`${name}-view`); if (section) section.classList.toggle('active',name === view);
@@ -312,8 +319,15 @@
     const [year,month] = calendarMonth.split('-').map(Number); const date = new Date(year,month - 1 + amount,1);
     calendarMonth = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2,'0')}`; renderCalendar();
   }
+  function mediaCaption(message) {
+    if (!MEDIA_TYPES.has(message.type)) return message.text;
+    const text = message.text.trim();
+    if (OLD_MEDIA_PLACEHOLDER.test(text) || /^\[(?:图片|语音|视频|表情|文件)\]$/.test(text)) return '';
+    return text;
+  }
   function searchText(message) {
-    return message.type === 'file' ? `${message.fileName || ''}${message.text ? `\n${message.text}` : ''}` : message.text;
+    const text = mediaCaption(message);
+    return message.type === 'file' ? `${message.fileName || ''}${text ? `\n${text}` : ''}` : text;
   }
   function resultExcerpt(message) {
     const text = searchText(message) || previewText(message); const match = searchQuery ? text.toLocaleLowerCase().indexOf(searchQuery.toLocaleLowerCase()) : -1;
@@ -322,6 +336,7 @@
   }
   function renderSearchResults() {
     const results = $('search-results'); if (!results) return;
+    releaseMediaUrls(); const version = renderVersion; const mediaJobs = [];
     const fragment = document.createDocumentFragment();
     const begin = searchPage * PAGE_SIZE; const end = Math.min(searchMatches.length,begin + PAGE_SIZE);
     if (!searchMatches.length) {
@@ -335,12 +350,20 @@
       }
       for (let offset = begin; offset < end; offset++) {
         const index = searchMatches[offset]; const message = data.messages[index];
-        const result = node('button','search-result'); result.type = 'button'; result.dataset.messageId = message.id; result.dataset.messageIndex = String(index);
-        result.append(makeAvatar(message.sender,'search-avatar'));
+        const result = node('article','search-result'); result.dataset.messageId = message.id; result.dataset.messageIndex = String(index);
+        const context = node('button','search-result-context'); context.type = 'button'; context.setAttribute('aria-label','查看原聊天');
+        context.append(makeAvatar(message.sender,'search-avatar'));
         const copy = node('div','search-result-copy'); const meta = node('div','search-result-meta');
         meta.append(node('strong','search-result-name',data.participants[message.sender].name),node('time','search-result-time',`${dateLabel(message.timestamp)} ${timeLabel(message.timestamp)}`));
         const text = node('p','search-result-text'); appendHighlighted(text,resultExcerpt(message),searchQuery);
-        copy.append(meta,text); result.append(copy); result.addEventListener('click',() => openChatAt(index)); fragment.append(result);
+        copy.append(meta,text);
+        if (MEDIA_TYPES.has(message.type)) {
+          const status = node('p','search-media-status media-loading','正在读取本机附件…'); status.setAttribute('aria-live','polite'); copy.append(status);
+          const preview = node('button','search-media-preview'); preview.type = 'button'; preview.hidden = true;
+          result.append(preview); mediaJobs.push({message,result,status,preview});
+        }
+        copy.append(node('span','search-context-link','查看原聊天 ›'));
+        context.append(copy); context.addEventListener('click',() => openChatAt(index)); result.prepend(context); fragment.append(result);
       }
     }
     results.replaceChildren(fragment);
@@ -350,8 +373,61 @@
     for (const tab of $('search-type-tabs').querySelectorAll('[data-search-type]')) {
       const selected = tab.dataset.searchType === searchType; tab.classList.toggle('selected',selected); tab.setAttribute('aria-pressed',String(selected));
     }
+    if (mediaJobs.length && currentView === 'search') hydrateSearchMedia(mediaJobs,version);
+  }
+  async function hydrateSearchMedia(jobs, version) {
+    const cid = conversationId(); let next = 0;
+    const active = job => version === renderVersion && currentView === 'search' && cid === conversationId() && job.result.isConnected;
+    const state = (job, name, text) => { if (active(job)) { job.status.className = `search-media-status media-${name}`; job.status.textContent = text; } };
+    async function worker() {
+      while (next < jobs.length && version === renderVersion && currentView === 'search') {
+        const job = jobs[next++];
+        try {
+          let url = resolveAsset(job.message.asset,job.message.type);
+          const saved = !url && cid ? await mediaStore.getMessageMedia(cid,job.message.id,job.message.asset) : null;
+          if (!active(job)) continue;
+          if (!url && !saved) { state(job,'missing','本机未找到附件'); continue; }
+          if (saved && (job.message.type !== 'file' && !saved.mime.startsWith(`${job.message.type}/`))) { state(job,'unsupported','附件格式不支持'); continue; }
+          state(job,'ready','本机已找到附件');
+          if (job.message.type === 'image') {
+            if (!url) { url = URL.createObjectURL(saved.blob); mediaUrls.add(url); }
+            const image = node('img','search-media-thumb'); image.alt = '图片预览'; image.loading = 'lazy'; image.decoding = 'async';
+            image.addEventListener('error',() => { if (active(job)) { job.preview.hidden = true; state(job,'unsupported','图片格式无法显示'); } });
+            image.src = url; job.preview.append(image); job.preview.hidden = false; job.preview.setAttribute('aria-label','预览图片');
+            job.preview.addEventListener('click',() => { if (active(job)) { pauseOtherMedia(); $('full-image').src = url; $('image-dialog').showModal(); } });
+          } else if (job.message.type === 'video') {
+            job.preview.append(node('span','search-video-play','▶'),node('span','search-video-label','预览'));
+            job.preview.hidden = false; job.preview.setAttribute('aria-label','预览视频');
+            job.preview.addEventListener('click',() => {
+              if (!active(job)) return;
+              // No video element or source is created for the results list. Load only on this click.
+              // A video preview owns its URL until close; the next click creates a fresh one.
+              const previewUrl = url || URL.createObjectURL(saved.blob);
+              if (previewUrl.startsWith('blob:')) mediaUrls.add(previewUrl);
+              openVideoPreview(previewUrl,() => state(job,'unsupported','此视频格式无法播放'));
+            });
+          }
+        } catch (_) { state(job,'unavailable','暂无法读取本机附件，请重试'); }
+      }
+    }
+    await Promise.all(Array.from({length:Math.min(4,jobs.length)},worker));
+  }
+  function openVideoPreview(url, onError) {
+    closeVideoPreview(); pauseOtherMedia(); videoPreviewError = onError; videoPreviewUrl = url;
+    const video = $('full-video'); $('video-preview-status').hidden = true;
+    video.preload = 'metadata'; video.src = url; $('video-dialog').showModal(); video.load();
+  }
+  function closeVideoPreview() {
+    videoPreviewError = null;
+    const url = videoPreviewUrl; videoPreviewUrl = '';
+    if (!url) return;
+    const video = $('full-video');
+    video.pause(); video.removeAttribute('src'); video.preload = 'none'; video.load();
+    if (url.startsWith('blob:')) { URL.revokeObjectURL(url); mediaUrls.delete(url); }
   }
   async function applyFilters() {
+    if (currentView !== 'search') return;
+    releaseMediaUrls();
     const generation = ++searchGeneration; const messages = data.messages;
     searchQuery = $('search-input').value.trim().slice(0,500); searchPage = 0;
     const query = searchQuery.toLocaleLowerCase(); const from = $('date-from').value; const to = $('date-to').value;
@@ -447,7 +523,7 @@
       video.addEventListener('play',() => pauseOtherMedia(video));
       video.addEventListener('error',() => { if (!bubble.querySelector('.missing-media')) bubble.append(node('div','missing-media','此视频格式无法播放，请保留原始附件')); }); bubble.append(video);
     }
-    const captionText = message.text.trim().replace(/^\[(?:图片|语音|视频|表情|文件)\](?=[（(](?:静态预览|仅缩略图))/, '');
+    const captionText = mediaCaption(message).replace(/^\[(?:图片|语音|视频|表情|文件)\](?=[（(](?:静态预览|仅缩略图))/, '');
     if (captionText && !/^\[(?:图片|语音|视频|表情|文件)\]$/.test(captionText)) { const caption = node('div','media-caption'); appendHighlighted(caption,captionText); bubble.append(caption); }
   }
   async function hydrateMedia(version) {
@@ -587,7 +663,7 @@
     if (!token || token === lastChangeToken) return;
     lastChangeToken = token;
     if (payload.kind === 'media') {
-      if (payload.conversationId === conversationId()) { refreshMediaStats(); if (currentView === 'chat') renderMessages(true); }
+      if (payload.conversationId === conversationId()) { refreshMediaStats(); if (currentView === 'chat') renderMessages(true); else if (currentView === 'search') renderSearchResults(); }
       return;
     }
     if (mediaImportController) mediaImportController.abort();
@@ -644,11 +720,13 @@
       $('media-progress').value = 100;
       status.textContent = `已处理 ${finished} 个媒体包${skipped ? `，其中 ${skipped} 个此前已导入` : ''}。附件保存在本机，请保留原媒体包。`;
       if (currentView === 'chat') renderMessages(true);
+      else if (currentView === 'search') renderSearchResults();
     } catch (error) {
       const stopped = error && error.name === 'AbortError';
       status.classList.toggle('error',!stopped);
       status.textContent = stopped ? '已取消。之前保存的附件仍在，重新选择同一包可继续。' : error && error.name === 'QuotaExceededError' ? '本地空间不足。已保存的附件仍在；腾出空间后重新选择同一包继续。' : `${error.message || '媒体导入失败'} 已保存的附件仍在，重新选择同一包可继续。`;
       announceRecordChange('media'); await refreshMediaStats(); if (currentView === 'chat') renderMessages(true);
+      else if (currentView === 'search') renderSearchResults();
     } finally {
       mediaImportController = null; $('media-file-zone').classList.remove('busy'); $('media-files').disabled = false; $('media-files').value = ''; $('cancel-media').hidden = true; $('clear-data').disabled = false;
     }
@@ -705,7 +783,7 @@
     const target = event.target.closest('[data-search-type]');
     if (target && ['all','image','audio','video','file'].includes(target.dataset.searchType)) { searchType = target.dataset.searchType; clearTimeout(searchTimer); applyFilters(); }
   });
-  $('search-input').addEventListener('input',() => { searchGeneration++; clearTimeout(searchTimer); searchTimer = setTimeout(applyFilters,180); });
+  $('search-input').addEventListener('input',() => { searchGeneration++; releaseMediaUrls(); clearTimeout(searchTimer); searchTimer = setTimeout(applyFilters,180); });
   $('date-from').addEventListener('change',applyFilters); $('date-to').addEventListener('change',applyFilters);
   $('clear-filters').addEventListener('click',() => { $('search-input').value = ''; $('date-from').value = ''; $('date-to').value = ''; searchType = 'all'; applyFilters(); });
   $('jump-latest').addEventListener('click',() => { contextTargetId = ''; pageEnd = data.messages.length; showView('chat'); });
@@ -722,6 +800,15 @@
   $('close-image').addEventListener('click', () => $('image-dialog').close());
   $('image-dialog').addEventListener('click', event => { if (event.target === $('image-dialog')) $('image-dialog').close(); });
   $('image-dialog').addEventListener('close', () => $('full-image').removeAttribute('src'));
+  $('close-video').addEventListener('click',() => { $('video-dialog').close(); closeVideoPreview(); });
+  $('video-dialog').addEventListener('click',event => { if (event.target === $('video-dialog')) { $('video-dialog').close(); closeVideoPreview(); } });
+  $('video-dialog').addEventListener('close',() => { if (!$('video-dialog').open) closeVideoPreview(); });
+  $('full-video').addEventListener('play',() => pauseOtherMedia($('full-video')));
+  $('full-video').addEventListener('error',() => {
+    if (!$('video-dialog').open || !$('full-video').hasAttribute('src')) return;
+    $('video-preview-status').textContent = '此视频格式无法播放，请保留原始附件。'; $('video-preview-status').hidden = false;
+    if (videoPreviewError) videoPreviewError();
+  });
   window.addEventListener('beforeinstallprompt', event => { event.preventDefault(); installPrompt = event; $('install-button').hidden = false; });
   $('install-button').addEventListener('click', async () => { if (!installPrompt) return; await installPrompt.prompt(); installPrompt = null; $('install-button').hidden = true; });
   window.addEventListener('appinstalled', () => { $('install-button').hidden = true; toast('已添加到桌面'); });
@@ -738,5 +825,5 @@
   if ('serviceWorker' in navigator && /^(https?:)$/.test(location.protocol)) navigator.serviceWorker.register('./sw.js').catch(() => {});
 
   // Expose only deterministic validation for offline verification; contains no chat data.
-  if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') window.chatViewerValidation = {validatePackage, dateKey};
+  if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') window.chatViewerValidation = {validatePackage, dateKey, mediaCaption};
 })();

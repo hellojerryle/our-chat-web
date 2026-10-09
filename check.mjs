@@ -21,7 +21,14 @@ const window = {addEventListener() {}, confirm() { return true; }};
 const context = {document, window, navigator: {}, location:{hostname:'localhost',protocol:'file:'}, localStorage:{getItem(){return null;},setItem(){}}, requestAnimationFrame(fn){fn();}, setTimeout(){return 1;}, clearTimeout(){}, URL, Blob, console,crypto:webcrypto,TextEncoder,TextDecoder,DOMException};
 vm.runInNewContext(fs.readFileSync(path.join(root,'media.js'),'utf8'), context, {filename:'media.js'});
 vm.runInNewContext(js, context, {filename:'app.js'});
-const {validatePackage,dateKey} = window.chatViewerValidation;
+const {validatePackage,dateKey,mediaCaption} = window.chatViewerValidation;
+assert.equal(mediaCaption({type:'image',text:'图片附件尚未导入'}), '');
+assert.equal(mediaCaption({type:'video',text:'视频附件尚未导入'}), '');
+assert.equal(mediaCaption({type:'audio',text:'语音附件尚未导入'}), '');
+assert.equal(mediaCaption({type:'image',text:'[图片]（附件未导入）'}), '');
+assert.equal(mediaCaption({type:'image',text:'[图片]（仅缩略图）'}), '[图片]（仅缩略图）');
+assert.equal(mediaCaption({type:'image',text:'图片附件尚未导入，请明天处理'}), '图片附件尚未导入，请明天处理');
+assert.equal(mediaCaption({type:'text',text:'图片附件尚未导入'}), '图片附件尚未导入');
 const empty = {schemaVersion:1,title:'我们的聊天',participants:{husband:{name:'我'},wife:{name:'她'}},messages:[],assets:{}};
 const base = JSON.parse(JSON.stringify(empty));
 base.messages = [
