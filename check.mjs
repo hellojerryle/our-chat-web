@@ -21,7 +21,27 @@ const window = {addEventListener() {}, confirm() { return true; }};
 const context = {document, window, navigator: {}, location:{hostname:'localhost',protocol:'file:'}, localStorage:{getItem(){return null;},setItem(){}}, requestAnimationFrame(fn){fn();}, setTimeout(){return 1;}, clearTimeout(){}, URL, Blob, console,crypto:webcrypto,TextEncoder,TextDecoder,DOMException};
 vm.runInNewContext(fs.readFileSync(path.join(root,'media.js'),'utf8'), context, {filename:'media.js'});
 vm.runInNewContext(js, context, {filename:'app.js'});
-const {validatePackage,dateKey,mediaCaption} = window.chatViewerValidation;
+const {validatePackage,dateKey,mediaCaption,messageCategory,transferDetails} = window.chatViewerValidation;
+const transferRawType = 2000 * 2 ** 32 + 49;
+assert.equal(messageCategory({type:'image',rawType:3}), 'image');
+assert.equal(messageCategory({type:'image',rawType:47}), 'emoji');
+assert.equal(messageCategory({type:'image',rawType:11000}), 'emoji');
+assert.equal(messageCategory({type:'image',text:'[表情]'}), 'image');
+assert.equal(messageCategory({type:'text',rawType:transferRawType}), 'transfer');
+assert.equal(messageCategory({type:'text',rawType:2001 * 2 ** 32 + 49}), 'text');
+assert.equal(messageCategory({type:'text',rawType:49}), 'text');
+assert.equal(messageCategory({type:'text',rawType:1,text:'微信转账\n12.34元'}), 'text');
+assert.equal(messageCategory({type:'image',rawType:transferRawType}), 'image');
+assert.equal(messageCategory({type:'text',rawType:47}), 'text');
+const transfer = text => transferDetails({type:'text',rawType:transferRawType,text});
+assert.equal(transfer('微信转账\n测试金额：￥12.34\n模拟说明').amountText,'￥12.34');
+assert.equal(transfer('微信转账\n测试金额：￥12.34元\n模拟说明').amountText,'￥12.34');
+assert.equal(transfer('微信转账\n测试记录为12.34元\n模拟说明').amountText,'￥12.34');
+for (const amount of ['￥1,234.56','￥12.345','￥12','-12.34元','-￥12.34元','- ￥12.34','￥12.34 与 ￥56.78','￥12.34，另有￥1,234.00','没有金额']) {
+  assert.equal(transfer(`微信转账\n${amount}`).amountText,'',`Ambiguous or unsupported amount: ${amount}`);
+}
+assert.equal(transfer('微信转账\n12.34元').statusText,'收款/退回状态未保留');
+assert.equal(transfer('微信转账\n12.34元').originalText,'微信转账\n12.34元');
 assert.equal(mediaCaption({type:'image',text:'图片附件尚未导入'}), '');
 assert.equal(mediaCaption({type:'video',text:'视频附件尚未导入'}), '');
 assert.equal(mediaCaption({type:'audio',text:'语音附件尚未导入'}), '');
@@ -30,6 +50,12 @@ assert.equal(mediaCaption({type:'image',text:'[图片]（仅缩略图）'}), '[�
 assert.equal(mediaCaption({type:'image',text:'图片附件尚未导入，请明天处理'}), '图片附件尚未导入，请明天处理');
 assert.equal(mediaCaption({type:'text',text:'图片附件尚未导入'}), '图片附件尚未导入');
 const empty = {schemaVersion:1,title:'我们的聊天',participants:{husband:{name:'我'},wife:{name:'她'}},messages:[],assets:{}};
+const classified = validatePackage({...empty,messages:[{id:'synthetic-transfer',sender:'husband',timestamp:123,type:'text',text:'微信转账',rawType:transferRawType}]});
+assert.equal(classified.messages[0].rawType,transferRawType);
+assert.equal(validatePackage(classified).messages[0].rawType,transferRawType);
+for (const rawType of [-1,47.5,'47',Number.MAX_SAFE_INTEGER + 1]) {
+  assert.throws(() => validatePackage({...empty,messages:[{sender:'wife',timestamp:123,type:'image',rawType}]}));
+}
 const base = JSON.parse(JSON.stringify(empty));
 base.messages = [
  {id:'2',sender:'wife',timestamp:'2026-10-10T00:01:00+08:00',type:'text',text:'第二条'},

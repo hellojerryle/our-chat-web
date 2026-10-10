@@ -25,6 +25,7 @@
   let indexedData = null;
   let dateIndex = new Map();
   let recordDays = [];
+  let missingRawTypeCount = 0;
   let calendarMonth = '';
   let selectedDate = '';
   let searchMatches = [];
@@ -106,9 +107,10 @@
       if (message.text != null && typeof message.text !== 'string') throw new Error(`第 ${index + 1} 条消息的 text 必须是文字。`);
       if (message.text && message.text.length > 1000000) throw new Error(`第 ${index + 1} 条消息文字过长。`);
       if (message.fileName != null && typeof message.fileName !== 'string') throw new Error(`第 ${index + 1} 条消息的 fileName 必须是文字。`);
+      if (message.rawType !== undefined && (!Number.isSafeInteger(message.rawType) || message.rawType < 0)) throw new Error(`第 ${index + 1} 条消息的 rawType 必须是非负安全整数。`);
       const asset = typeof message.asset === 'string' ? message.asset : '';
       const duration = typeof message.duration === 'number' ? message.duration : NaN;
-      return {id, sender: message.sender, timestamp, type: message.type, text: message.text || '', asset, fileName:message.type === 'file' ? safeFileName(message.fileName) : undefined, duration: Number.isFinite(duration) && duration >= 0 ? duration : null, _order: index};
+      return {id, sender: message.sender, timestamp, type: message.type, text: message.text || '', asset, rawType:message.rawType, fileName:message.type === 'file' ? safeFileName(message.fileName) : undefined, duration: Number.isFinite(duration) && duration >= 0 ? duration : null, _order: index};
     }).sort((a, b) => a.timestamp - b.timestamp || a._order - b._order);
     const metadata = input.metadata && typeof input.metadata === 'object' && !Array.isArray(input.metadata) ? {...input.metadata} : {};
     if (metadata.conversationId != null) {
@@ -175,8 +177,45 @@
   function timeLabel(timestamp) {
     return new Date(timestamp).toLocaleTimeString('zh-CN', {hour:'2-digit', minute:'2-digit', hour12:false});
   }
+  function messageCategory(message) {
+    if (Number.isSafeInteger(message.rawType) && message.rawType >= 0) {
+      const base = message.rawType % (2 ** 32);
+      const subtype = Math.floor(message.rawType / (2 ** 32));
+      if (message.type === 'image' && (base === 47 || base === 11000)) return 'emoji';
+      if (message.type === 'text' && base === 49 && subtype === 2000) return 'transfer';
+    }
+    return message.type;
+  }
+  function transferDetails(message) {
+    if (messageCategory(message) !== 'transfer') return null;
+    const originalText = typeof message.text === 'string' ? message.text : '';
+    // Count complete currency candidates, including unsupported signed or grouped amounts.
+    // A malformed second amount must not make the first valid amount look unique.
+    const candidates = Array.from(originalText.matchAll(/(?:[+\-][ \t]*)?(?:[¥￥][ \t]*)+[+\-]?[ \t]*[0-9]+(?:[.,][0-9]+)*(?:[ \t]*元)?|(?:[+\-][ \t]*)?[0-9]+(?:[.,][0-9]+)*[ \t]*元/gu));
+    let amountText = '';
+    if (candidates.length === 1) {
+      const candidate = candidates[0];
+      const before = originalText.slice(0,candidate.index).replace(/[ \t]+$/,'').slice(-1);
+      const after = originalText.slice(candidate.index + candidate[0].length).replace(/^[ \t]+/,'').slice(0,1);
+      const blockedBoundary = /[0-9.,+\-¥￥A-Za-z]/;
+      const amount = /^(?:[¥￥][ \t]*([0-9]+\.[0-9]{2})(?:[ \t]*元)?|([0-9]+\.[0-9]{2})[ \t]*元)$/u.exec(candidate[0]);
+      if (amount && !blockedBoundary.test(before) && !blockedBoundary.test(after)) amountText = `￥${amount[1] || amount[2]}`;
+    }
+    return {amountText, originalText, statusText:'收款/退回状态未保留'};
+  }
+  function makeTransferSummary(message, className) {
+    const details = transferDetails(message);
+    const card = node('div',className);
+    card.append(node('span','transfer-heading','历史转账'),node('strong','transfer-amount',details.amountText || '金额未识别'));
+    const note = node('p','transfer-note'); appendHighlighted(note,details.originalText,searchQuery); card.append(note);
+    card.append(node('p','transfer-status',details.statusText));
+    return card;
+  }
   function previewText(message) {
     if (!message) return '还没有消息，导入后就能开始翻看';
+    const category = messageCategory(message);
+    if (category === 'emoji') return '[表情]';
+    if (category === 'transfer') return `[转账] ${transferDetails(message).amountText || '金额未识别'}`;
     if (message.type === 'file') return `[文件] ${message.fileName}`;
     const labels = {image:'[图片]', audio:'[语音]', video:'[视频]', system:'[提示]'};
     return mediaCaption(message) || labels[message.type] || '';
@@ -207,11 +246,12 @@
   function ensureIndexes() {
     if (indexedData === data) return;
     indexedData = data; searchGeneration++;
-    dateIndex = new Map(); recordDays = []; searchMatches = []; searchPage = 0;
+    dateIndex = new Map(); recordDays = []; searchMatches = []; searchPage = 0; missingRawTypeCount = 0;
     filtered = data.messages; pageEnd = data.messages.length;
     contextTargetId = ''; clearTimeout(contextTimer);
     let nextBoundary = -1; let currentDay = '';
     for (let index = 0; index < data.messages.length; index++) {
+      if (data.messages[index].rawType === undefined) missingRawTypeCount++;
       const timestamp = data.messages[index].timestamp;
       if (timestamp >= nextBoundary) {
         currentDay = dateKey(timestamp);
@@ -334,8 +374,13 @@
     const begin = Math.max(0,match - 45); const end = Math.min(text.length,begin + Math.max(220,searchQuery.length + 90));
     return `${begin ? '…' : ''}${text.slice(begin,end)}${end < text.length ? '…' : ''}`;
   }
+  function refreshClassificationNotice() {
+    const notice = $('classification-notice');
+    if (notice) notice.hidden = isDemo || !missingRawTypeCount || !['image','emoji','transfer'].includes(searchType);
+  }
   function renderSearchResults() {
     const results = $('search-results'); if (!results) return;
+    refreshClassificationNotice();
     releaseMediaUrls(); const version = renderVersion; const mediaJobs = [];
     const fragment = document.createDocumentFragment();
     const begin = searchPage * PAGE_SIZE; const end = Math.min(searchMatches.length,begin + PAGE_SIZE);
@@ -356,7 +401,9 @@
         const copy = node('div','search-result-copy'); const meta = node('div','search-result-meta');
         meta.append(node('strong','search-result-name',data.participants[message.sender].name),node('time','search-result-time',`${dateLabel(message.timestamp)} ${timeLabel(message.timestamp)}`));
         const text = node('p','search-result-text'); appendHighlighted(text,resultExcerpt(message),searchQuery);
-        copy.append(meta,text);
+        copy.append(meta);
+        if (messageCategory(message) === 'transfer') copy.append(makeTransferSummary(message,'search-transfer-summary'));
+        else copy.append(text);
         if (MEDIA_TYPES.has(message.type)) {
           const status = node('p','search-media-status media-loading','正在读取本机附件…'); status.setAttribute('aria-live','polite'); copy.append(status);
           const preview = node('button','search-media-preview'); preview.type = 'button'; preview.hidden = true;
@@ -391,9 +438,11 @@
           state(job,'ready','本机已找到附件');
           if (job.message.type === 'image') {
             if (!url) { url = URL.createObjectURL(saved.blob); mediaUrls.add(url); }
-            const image = node('img','search-media-thumb'); image.alt = '图片预览'; image.loading = 'lazy'; image.decoding = 'async';
+            const emoji = messageCategory(job.message) === 'emoji';
+            if (emoji) job.preview.classList.add('search-emoji-preview');
+            const image = node('img','search-media-thumb'); image.alt = emoji ? '表情预览' : '图片预览'; image.loading = 'lazy'; image.decoding = 'async';
             image.addEventListener('error',() => { if (active(job)) { job.preview.hidden = true; state(job,'unsupported','图片格式无法显示'); } });
-            image.src = url; job.preview.append(image); job.preview.hidden = false; job.preview.setAttribute('aria-label','预览图片');
+            image.src = url; job.preview.append(image); job.preview.hidden = false; job.preview.setAttribute('aria-label',emoji ? '预览表情' : '预览图片');
             job.preview.addEventListener('click',() => { if (active(job)) { pauseOtherMedia(); $('full-image').src = url; $('image-dialog').showModal(); } });
           } else if (job.message.type === 'video') {
             job.preview.append(node('span','search-video-play','▶'),node('span','search-video-label','预览'));
@@ -430,6 +479,7 @@
     releaseMediaUrls();
     const generation = ++searchGeneration; const messages = data.messages;
     searchQuery = $('search-input').value.trim().slice(0,500); searchPage = 0;
+    refreshClassificationNotice();
     const query = searchQuery.toLocaleLowerCase(); const from = $('date-from').value; const to = $('date-to').value;
     if (from && to && from > to) { searchMatches = []; renderSearchResults(); toast('开始日期不能晚于结束日期'); return; }
     if (!query && searchType === 'all' && !from && !to) { searchMatches = []; renderSearchResults(); return; }
@@ -440,7 +490,7 @@
     $('search-count').textContent = '正在查找…';
     for (let index = messages.length - 1; index >= 0; index--) {
       const message = messages[index];
-      if ((kind === 'all' || message.type === kind) && message.timestamp >= start && message.timestamp < stop
+      if ((kind === 'all' || messageCategory(message) === kind) && message.timestamp >= start && message.timestamp < stop
           && (!query || searchText(message).toLocaleLowerCase().includes(query))) matches.push(index);
       if (index % 8192 === 0) {
         await new Promise(resolve => setTimeout(resolve,0));
@@ -481,6 +531,8 @@
   }
   function fillMediaBubble(bubble,message,url,duration) {
     bubble.replaceChildren(); bubble.className = 'message-bubble';
+    const emoji = messageCategory(message) === 'emoji';
+    if (emoji) bubble.classList.add('emoji-bubble');
     if (!url) bubble.append(missingMedia(message));
     else if (message.type === 'file') {
       bubble.classList.add('file-bubble'); bubble.append(node('strong','file-name',message.fileName));
@@ -524,6 +576,7 @@
       video.addEventListener('error',() => { if (!bubble.querySelector('.missing-media')) bubble.append(node('div','missing-media','此视频格式无法播放，请保留原始附件')); }); bubble.append(video);
     }
     const captionText = mediaCaption(message).replace(/^\[(?:图片|语音|视频|表情|文件)\](?=[（(](?:静态预览|仅缩略图))/, '');
+    if (emoji) bubble.append(node('span','emoji-label','[表情]'));
     if (captionText && !/^\[(?:图片|语音|视频|表情|文件)\]$/.test(captionText)) { const caption = node('div','media-caption'); appendHighlighted(caption,captionText); bubble.append(caption); }
   }
   async function hydrateMedia(version) {
@@ -551,7 +604,10 @@
     const row = node('article',`message-row${mine ? ' mine' : ''}${message.id === contextTargetId ? ' context-target' : ''}`);
     row.dataset.messageId = message.id; row.append(makeAvatar(message.sender));
     const content = node('div','message-content'); const bubble = node('div','message-bubble');
-    if (message.type === 'text') appendHighlighted(bubble,message.text);
+    if (messageCategory(message) === 'transfer') {
+      bubble.classList.add('transfer-card'); bubble.append(makeTransferSummary(message,'transfer-card-content'));
+      bubble.append(node('time','transfer-time',`${dateLabel(message.timestamp)} ${timeLabel(message.timestamp)}`));
+    } else if (message.type === 'text') appendHighlighted(bubble,message.text);
     else {
       const url = resolveAsset(message.asset,message.type); fillMediaBubble(bubble,message,url,message.duration);
       if (!url && conversationId() && currentView === 'chat') mediaQueue.push({bubble,message});
@@ -687,6 +743,10 @@
     if (mediaImportController) { toast('媒体正在导入，完成或取消后再导入聊天 JSON'); return; }
     $('import-status').classList.remove('error'); $('import-status').textContent = '新文件会替换本设备上现有的记录。'; $('import-file').value = ''; $('import-dialog').showModal();
   }
+  function openClassificationImport() {
+    openImport();
+    if ($('import-dialog').open) $('import-status').textContent = '重新选择原聊天 JSON 即可更新分类。同一段聊天（会话标识相同）的已导入媒体会保留，无需重导 ZIP。';
+  }
   async function openMediaImport() {
     if (!conversationId()) { toast('请先导入包含会话标识的聊天 JSON'); return; }
     if ($('import-dialog').open) $('import-dialog').close();
@@ -779,9 +839,10 @@
   on('calendar-prev','click',() => moveCalendarMonth(-1));
   on('calendar-next','click',() => moveCalendarMonth(1));
   on('search-more','click',() => { searchPage++; renderSearchResults(); $('search-results').scrollTop = 0; });
+  on('classification-import','click',openClassificationImport);
   on('search-type-tabs','click',event => {
     const target = event.target.closest('[data-search-type]');
-    if (target && ['all','image','audio','video','file'].includes(target.dataset.searchType)) { searchType = target.dataset.searchType; clearTimeout(searchTimer); applyFilters(); }
+    if (target && ['all','image','emoji','transfer','audio','video','file'].includes(target.dataset.searchType)) { searchType = target.dataset.searchType; clearTimeout(searchTimer); applyFilters(); }
   });
   $('search-input').addEventListener('input',() => { searchGeneration++; releaseMediaUrls(); clearTimeout(searchTimer); searchTimer = setTimeout(applyFilters,180); });
   $('date-from').addEventListener('change',applyFilters); $('date-to').addEventListener('change',applyFilters);
@@ -825,5 +886,5 @@
   if ('serviceWorker' in navigator && /^(https?:)$/.test(location.protocol)) navigator.serviceWorker.register('./sw.js').catch(() => {});
 
   // Expose only deterministic validation for offline verification; contains no chat data.
-  if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') window.chatViewerValidation = {validatePackage, dateKey, mediaCaption};
+  if (location.hostname === 'localhost' || location.hostname === '127.0.0.1') window.chatViewerValidation = {validatePackage, dateKey, mediaCaption, messageCategory, transferDetails};
 })();
