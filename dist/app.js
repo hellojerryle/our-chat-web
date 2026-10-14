@@ -766,7 +766,7 @@
       for (let index = 0; index < files.length; index++) {
         if (controller.signal.aborted) throw new DOMException('已取消导入','AbortError');
         const file = files[index];
-        const result = await importMediaPack(file,cid,{signal:controller.signal,onProgress:progress => {
+        const result = await importMediaPack(file,cid,{signal:controller.signal,getStorageEstimate:navigator.storage && navigator.storage.estimate ? () => navigator.storage.estimate() : undefined,onProgress:progress => {
           const now = Date.now();
           if (progress.phase === 'checking' && now - lastPaint < 120) return; lastPaint = now;
           const fraction = progress.totalBytes ? progress.bytesDone / progress.totalBytes : progress.phase === 'complete' ? 1 : 0;
@@ -784,7 +784,7 @@
     } catch (error) {
       const stopped = error && error.name === 'AbortError';
       status.classList.toggle('error',!stopped);
-      status.textContent = stopped ? '已取消。之前保存的附件仍在，重新选择同一包可继续。' : error && error.name === 'QuotaExceededError' ? '本地空间不足。已保存的附件仍在；腾出空间后重新选择同一包继续。' : `${error.message || '媒体导入失败'} 已保存的附件仍在，重新选择同一包可继续。`;
+      status.textContent = stopped ? '已取消。之前保存的附件仍在，重新选择同一包可继续。' : error && ['StorageGrowthError','StorageSpaceError'].includes(error.name) ? `${error.message} 已保存的附件没有自动删除，请保留电脑上的原文件。` : error && error.name === 'QuotaExceededError' ? '本地空间不足。已保存的附件仍在；请先检查手机储存空间。若空间异常暴涨，不要反复重试导入。' : `${error.message || '媒体导入失败'} 已保存的附件仍在，重新选择同一包可继续。`;
       announceRecordChange('media'); await refreshMediaStats(); if (currentView === 'chat') renderMessages(true);
       else if (currentView === 'search') renderSearchResults();
     } finally {

@@ -6,7 +6,7 @@ import vm from 'node:vm';
 const source = fs.readFileSync(new URL('./dist/sw.js', import.meta.url), 'utf8');
 const scope = 'https://example.github.io/our-chat-web/';
 const prefix = `our-chat-shell:${encodeURIComponent(scope)}:`;
-const current = `${prefix}v8`;
+const current = `${prefix}v9`;
 const otherPrefix = `our-chat-shell:${encodeURIComponent('https://example.github.io/other-app/')}:`;
 
 class TestResponse {

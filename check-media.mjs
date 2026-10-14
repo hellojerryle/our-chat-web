@@ -5,9 +5,47 @@ import path from 'node:path';
 import {webcrypto} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 const root = path.dirname(fileURLToPath(import.meta.url));
-const context = {Blob,TextDecoder,TextEncoder,DOMException,crypto:webcrypto,console};
+// Track Blob *sources*, not just read sizes. A wrapper such as new Blob([zip.slice(...)])
+// still points at the ZIP backing data and must not satisfy independent materialization.
+const sourceRoots = new WeakMap();
+const constructedParts = new WeakMap();
+let sourceSequence = 0;
+let largestOwnedBytePart = 0;
+function rootsOf(blob) { return sourceRoots.get(blob) || new Set(); }
+function trackDerived(blob, sources) {
+  sourceRoots.set(blob,new Set(sources));
+  const slice = blob.slice.bind(blob);
+  blob.slice = (start,end,type) => trackDerived(slice(start,end,type),sources);
+  return blob;
+}
+function trackSource(blob, sourceId = ++sourceSequence) { return trackDerived(blob,new Set([sourceId])); }
+class TrackedBlob extends Blob {
+  constructor(parts = [], options) {
+    super(parts,options);
+    const sources = new Set();
+    for (const part of parts) {
+      if (part instanceof Blob) for (const id of rootsOf(part)) sources.add(id);
+      else if (ArrayBuffer.isView(part)) largestOwnedBytePart = Math.max(largestOwnedBytePart,part.byteLength);
+      else if (part instanceof ArrayBuffer) largestOwnedBytePart = Math.max(largestOwnedBytePart,part.byteLength);
+    }
+    sourceRoots.set(this,sources);
+    constructedParts.set(this,parts.map(part => part instanceof Blob ? 'Blob' : ArrayBuffer.isView(part) ? 'BufferSource' : part instanceof ArrayBuffer ? 'BufferSource' : typeof part));
+  }
+  slice(start,end,type) {
+    return trackDerived(super.slice(start,end,type),rootsOf(this));
+  }
+}
+const context = {Blob:TrackedBlob,TextDecoder,TextEncoder,DOMException,crypto:webcrypto,console};
 vm.runInNewContext(fs.readFileSync(path.join(root,'dist','media.js'),'utf8'),context);
 const api = context.OurChatMedia;
+const tracingControl = trackSource(new Blob([new Uint8Array([1,2,3,4])]));
+const tracingSlice = tracingControl.slice(1,3);
+assert.equal(rootsOf(tracingSlice).size,1);
+assert.equal(rootsOf(new TrackedBlob([tracingSlice])).size,1,'Reboxing a ZIP slice is not independent');
+assert.equal(rootsOf(new TrackedBlob([tracingSlice]).slice(0,1).slice(0,1).slice(0,1)).size,1,'ZIP ancestry survives repeated slicing and reboxing');
+const tracingIndependent = new TrackedBlob([new Uint8Array(await tracingSlice.arrayBuffer())]);
+assert.equal(rootsOf(tracingIndependent).size,0);
+assert.deepEqual([...new Uint8Array(await tracingIndependent.arrayBuffer())],[2,3]);
 const cid = '0123456789abcdef01234567';
 const image = Uint8Array.from(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+cgwAAAABJRU5ErkJggg==','base64'));
 async function zip(entries,name='media-test.zip') {
@@ -25,7 +63,7 @@ async function zip(entries,name='media-test.zip') {
   }
   const size = directory.reduce((sum,part) => sum + part.length,0); const end = new Uint8Array(22); const e = new DataView(end.buffer);
   e.setUint32(0,0x06054b50,true); e.setUint16(8,entries.length,true); e.setUint16(10,entries.length,true); e.setUint32(12,size,true); e.setUint32(16,offset,true);
-  const result = new Blob([...parts,...directory,end],{type:'application/zip'}); result.name = name; return result;
+  const result = new Blob([...parts,...directory,end],{type:'application/zip'}); result.name = name; return trackSource(result);
 }
 async function pack(assets = [{key:'photo.png',bytes:image,mime:'image/png'}],overrides={}) {
   const manifest = {kind:'our-chat-media',schemaVersion:1,conversationId:cid,assets:assets.map(item => ({key:item.key,path:`assets/${item.key}`,mime:item.mime,size:(item.blob || new Blob([item.bytes])).size})),messageAssets:assets.map((item,index) => ({id:`message_0.db:${index + 1}`,asset:item.key})),...overrides};
@@ -38,12 +76,13 @@ function memoryStore() {
     async getPack(cid,id){return packs.get(`${cid}/${id}`);},
     async writePack(state){const key = `${state.conversationId}/${state.packId}`; const old = packs.get(key); if (old?.status === 'complete' && state.status === 'incomplete') return; packs.set(key,{...state});},
     async getAssetInfo(cid,key){const entry=assets.get(`${cid}/${key}`); return entry && {size:entry.size,crc32:entry.crc32,mime:entry.mime};},
-    async putAsset(cid,item,blob,state){if (puts >= quotaAfter) throw new DOMException('quota','QuotaExceededError'); assert(blob instanceof Blob); assets.set(`${cid}/${item.key}`,{...item,blob}); puts++; await this.writePack(state);},
+    async putAsset(cid,item,blob,state){if (puts >= quotaAfter) throw new DOMException('quota','QuotaExceededError'); assert(blob instanceof Blob); assert.equal(rootsOf(blob).size,0,'Stored Blob retains the original ZIP File/Blob source (slice or reboxed slice)'); assert(constructedParts.has(blob),'Stored Blob was not independently constructed from ZIP bytes'); assets.set(`${cid}/${item.key}`,{...item,blob}); puts++; await this.writePack(state);},
     async putLinks(cid,values){for(const item of values) links.set(`${cid}/${item.id}`,item);}
   };
 }
 const store = memoryStore(); const importer = api.createImporter(store); const good = await pack();
 assert.equal((await importer(good,cid)).skipped,false); assert.equal(store.assets.size,1); assert.equal(store.links.size,1);
+assert.deepEqual(new Uint8Array(await store.assets.values().next().value.blob.arrayBuffer()),image,'Independent attachment bytes must match the ZIP entry');
 assert.equal((await importer(good,cid)).skipped,true); assert.equal(store.puts,1);
 const filesStore=memoryStore();
 const filesPack=await pack([{key:'test.pdf',bytes:new TextEncoder().encode('%PDF-1.4\n%%EOF'),mime:'application/pdf'},{key:'document.docx',bytes:new Uint8Array([80,75,3,4]),mime:'application/vnd.openxmlformats-officedocument.wordprocessingml.document'},{key:'download.html',bytes:new TextEncoder().encode('<script>window.__fileExecuted=true</script>'),mime:'application/octet-stream'}]);
@@ -64,6 +103,35 @@ await resume(two,cid); assert.equal(resumeStore.assets.size,2); assert.equal(res
 const quotaStore = memoryStore(); quotaStore.quotaAfter=1; const quotaImport=api.createImporter(quotaStore);
 await assert.rejects(quotaImport(two,cid),error => error.name==='QuotaExceededError'); assert.equal(quotaStore.assets.size,1);
 quotaStore.quotaAfter=Infinity; await quotaImport(two,cid); assert.equal(quotaStore.assets.size,2); assert.equal(quotaStore.puts,2);
+// Storage estimates are browser-provided and optional. They must not turn unavailable
+// APIs into failures or prevent skipping already-complete packs without fresh writes.
+const MiB = 1024 * 1024;
+const savedBytes = store => [...store.assets.values()].reduce((sum,item)=>sum+item.size,0);
+const healthyEstimate = store => async () => ({usage:100*MiB+savedBytes(store),quota:1024*MiB});
+const estimateStore=memoryStore(); const estimateImport=api.createImporter(estimateStore);
+let estimateCalls=0;
+await estimateImport(good,cid,{getStorageEstimate:async()=>{estimateCalls++;return healthyEstimate(estimateStore)();}});
+assert(estimateCalls>0,'Storage guard must use the optional estimate hook on new assets');
+assert.equal(estimateStore.assets.size,1);
+const repeatPuts=estimateStore.puts;
+assert.equal((await estimateImport(good,cid,{getStorageEstimate:async()=>({usage:100*MiB,quota:100*MiB})})).skipped,true);
+assert.equal(estimateStore.puts,repeatPuts,'A complete pack must not write or materialize again at low quota');
+const duplicateAndNew=await pack([{key:'photo.png',bytes:image,mime:'image/png'},{key:'new.png',bytes:image,mime:'image/png'}]);
+await estimateImport(duplicateAndNew,cid,{getStorageEstimate:healthyEstimate(estimateStore)});
+assert.equal(estimateStore.assets.size,2);assert.equal(estimateStore.puts,2,'Same-CID asset reuse across packs must not write a duplicate Blob');
+const lowSpaceStore=memoryStore();
+await assert.rejects(api.createImporter(lowSpaceStore)(good,cid,{getStorageEstimate:async()=>({usage:100*MiB,quota:100*MiB+image.length+32*MiB-1})}),error=>error.name==='StorageSpaceError');
+assert.equal(lowSpaceStore.assets.size,0,'Low-space preflight must stop before saving new assets');
+const growthStore=memoryStore(); const growthImport=api.createImporter(growthStore);
+await assert.rejects(growthImport(good,cid,{getStorageEstimate:async()=>({usage:100*MiB+(growthStore.assets.size?256*MiB+savedBytes(growthStore)*5:0),quota:1024*MiB})}),error=>error.name==='StorageGrowthError');
+assert.equal(growthStore.assets.size,1,'Abnormal growth stops future work without deleting committed attachments');
+assert.equal(growthStore.links.size,0);assert.equal([...growthStore.packs.values()][0].status,'incomplete');
+await growthImport(good,cid,{getStorageEstimate:healthyEstimate(growthStore)});
+assert.equal(growthStore.assets.size,1);assert.equal(growthStore.puts,1);assert.equal(growthStore.links.size,1);
+assert.equal([...growthStore.packs.values()][0].status,'complete','An interrupted pack can resume without rewriting saved assets');
+for (const getStorageEstimate of [async()=>undefined,async()=>null,async()=>({usage:NaN,quota:1024*MiB}),async()=>({usage:0,quota:Infinity}),async()=>{throw new Error('Estimate API unavailable');}]) {
+  const unavailableStore=memoryStore();await api.createImporter(unavailableStore)(good,cid,{getStorageEstimate});assert.equal(unavailableStore.assets.size,1);
+}
 let largestRead=0; let wholeReads=0;
 function boundReads(blob,whole=false) {
   const arrayBuffer=blob.arrayBuffer.bind(blob); const slice=blob.slice.bind(blob);
@@ -74,6 +142,12 @@ const megabyte = new Uint8Array(1024 * 1024); const largeBlob = new Blob(Array.f
 const large = boundReads(await pack([{key:'large.mp4',blob:largeBlob,mime:'video/mp4'}]),true);
 const largeStore=memoryStore(); await api.createImporter(largeStore)(large,cid);
 assert.equal(wholeReads,0);assert(largestRead<=api.CHUNK_SIZE);assert.equal(largeStore.assets.values().next().value.blob.size,64*1024*1024);
+assert.equal(rootsOf(largeStore.assets.values().next().value.blob).size,0,'Large stored attachment must not retain its ZIP source');
+assert(largestOwnedBytePart<=api.CHUNK_SIZE,'Independent owned-byte chunks must remain <=2 MiB (not the entire attachment)');
+const midReadStore=memoryStore(),midReadController=new AbortController();
+await assert.rejects(api.createImporter(midReadStore)(large,cid,{signal:midReadController.signal,onProgress(state){if(state.phase==='checking'&&state.bytesDone>=api.CHUNK_SIZE)midReadController.abort();}}),error=>error.name==='AbortError');
+assert.equal(midReadStore.assets.size,0,'Cancellation during byte materialization must not commit a partial attachment');
+assert.equal([...midReadStore.packs.values()][0].status,'incomplete');
 if(process.argv.includes('--fixtures')) {
   const fixtureRoot=path.join(root,'qa-media');fs.mkdirSync(fixtureRoot,{recursive:true});
   const chat={schemaVersion:1,title:'测试聊天',metadata:{conversationId:cid},participants:{husband:{name:'测试甲'},wife:{name:'测试乙'}},messages:[{id:'message_0.db:1',sender:'wife',timestamp:1234,type:'image',text:'仅供测试的单像素图片'}],assets:{}};
@@ -84,4 +158,4 @@ if(process.argv.includes('--fixtures')) {
   const fileChat={...chat,messages:[{id:'message_0.db:1',sender:'wife',timestamp:1234,type:'file',fileName:'测试文档.pdf'},{id:'message_0.db:2',sender:'husband',timestamp:1235,type:'file',fileName:'文件卡片.docx'},{id:'message_0.db:3',sender:'wife',timestamp:1236,type:'file',fileName:'仅下载不执行.html'}]};
   fs.writeFileSync(path.join(fixtureRoot,'chat-files.json'),JSON.stringify(fileChat));fs.writeFileSync(path.join(fixtureRoot,'media-files.zip'),Buffer.from(await filesPack.arrayBuffer()));
 }
-console.log('PASS: ZIP_STORED image/PDF/Office/opaque-file import, manifest/conversation validation, repeat skip, corrupt/truncated/unsafe/compressed rejection, cancellation/resume, quota resume, 64 MiB Blob with <=2 MiB reads and no whole-ZIP arrayBuffer.');
+console.log('PASS: ZIP_STORED image/PDF/Office/opaque-file import; ZIP ancestry tracking rejects original/reboxed slices; independent <=2 MiB owned-byte chunks; exact stored bytes; validation, duplicate-asset/complete-pack skip, corruption rejection, mid-read cancellation/resume, quota resume, optional storage-estimate/unavailable handling, low-space preflight, abnormal-growth stop/resume, 64 MiB independent attachment without whole-ZIP arrayBuffer.');

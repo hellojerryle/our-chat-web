@@ -37,6 +37,36 @@
     }
     checkAbort(signal); return (crc ^ 0xffffffff) >>> 0;
   }
+  async function copyAssetBytes(file, item, signal, progress) {
+    const parts = []; let crc = 0xffffffff;
+    for (let offset = 0; offset < item.size; offset += CHUNK_SIZE) {
+      checkAbort(signal);
+      const length = Math.min(CHUNK_SIZE,item.size - offset);
+      const bytes = await readRange(file,item.dataOffset + offset,length);
+      checkAbort(signal); crc = updateCrc(crc,bytes);
+      // Materialize bytes before persisting. A Blob sliced from the selected ZIP
+      // can retain the entire source file in WebKit's IndexedDB backing storage.
+      // Wrapping that slice in another Blob would still retain the source.
+      parts.push(new Blob([bytes]));
+      if (progress) progress(offset + length);
+    }
+    checkAbort(signal);
+    return {blob:new Blob(parts,{type:item.mime}),crc32:(crc ^ 0xffffffff) >>> 0};
+  }
+  async function storageEstimate(getEstimate) {
+    if (typeof getEstimate !== 'function') return null;
+    try {
+      const value = await getEstimate();
+      if (!value || !Number.isFinite(value.usage) || value.usage < 0) return null;
+      return {usage:value.usage,quota:Number.isFinite(value.quota) && value.quota >= 0 ? value.quota : null};
+    } catch (_) { return null; }
+  }
+  function storageError(name,message) { const error = new Error(message); error.name = name; return error; }
+  function checkStorageGrowth(baseline,current,writtenBytes) {
+    if (baseline && current && current.usage - baseline.usage > writtenBytes * 4 + 64 * 1024 * 1024) {
+      throw storageError('StorageGrowthError','检测到浏览器存储异常增长，已停止导入。请先检查 iPhone 储存空间，不要继续导入大包。');
+    }
+  }
   async function parseStoredZip(file, signal) {
     checkAbort(signal);
     if (!file || !Number.isSafeInteger(file.size) || file.size < 22 || file.size >= 0xffffffff) invalid('需要小于 4 GB 的普通 ZIP 包');
@@ -120,24 +150,31 @@
   }
   function createImporter(store) {
     return async function importPack(file, conversationId, options = {}) {
-      const {signal,onProgress = () => {}} = options;
+      const {signal,onProgress = () => {},getStorageEstimate} = options;
       if (!/^[a-f0-9]{24}$/.test(conversationId || '')) throw new Error('请先导入包含会话标识的聊天 JSON。');
       onProgress({phase:'reading',name:file.name || '媒体包'});
       const parsed = await parseStoredZip(file, signal);
       const manifest = validateManifest(parsed.manifest, conversationId, parsed.entries);
       const previous = await store.getPack(conversationId,parsed.packId);
       if (previous && previous.status === 'complete') { onProgress({phase:'complete',name:file.name,skipped:true,totalBytes:manifest.totalBytes,bytesDone:manifest.totalBytes,totalAssets:manifest.assets.length,assetIndex:manifest.assets.length}); return {skipped:true,assets:manifest.assets.length,bytes:manifest.totalBytes}; }
+      const baseline = await storageEstimate(getStorageEstimate); let writtenBytes = 0;
       const state = {conversationId,packId:parsed.packId,name:String(file.name || '媒体包').slice(0,200),status:'incomplete',assetsCompleted:0,totalAssets:manifest.assets.length,totalBytes:manifest.totalBytes};
       await store.writePack(state); let bytesDone = 0;
       for (let i = 0; i < manifest.assets.length; i++) {
         checkAbort(signal); const item = manifest.assets[i]; const existing = await store.getAssetInfo(conversationId,item.key);
         if (existing && (existing.size !== item.size || existing.crc32 !== item.crc32 || existing.mime !== item.mime)) invalid('同一附件键对应不同内容');
         if (!existing) {
-          const blob = file.slice(item.dataOffset,item.dataOffset + item.size,item.mime);
-          const crc = await crcBlob(blob,signal,done => onProgress({phase:'checking',name:state.name,assetIndex:i,totalAssets:manifest.assets.length,bytesDone:bytesDone + done,totalBytes:manifest.totalBytes}));
-          if (crc !== item.crc32) invalid(`附件 ${item.key} 的 CRC 校验失败，请重新复制原媒体包`);
+          const available = await storageEstimate(getStorageEstimate); checkAbort(signal);
+          checkStorageGrowth(baseline,available,writtenBytes);
+          if (available && available.quota !== null && available.quota - available.usage < item.size + 32 * 1024 * 1024) {
+            throw storageError('StorageSpaceError','浏览器估计可用空间不足，已停止导入。请检查设备储存空间后再继续。');
+          }
+          const copied = await copyAssetBytes(file,item,signal,done => onProgress({phase:'checking',name:state.name,assetIndex:i,totalAssets:manifest.assets.length,bytesDone:bytesDone + done,totalBytes:manifest.totalBytes}));
+          if (copied.crc32 !== item.crc32) invalid(`附件 ${item.key} 的 CRC 校验失败，请重新复制原媒体包`);
           checkAbort(signal); state.assetsCompleted = i + 1;
-          await store.putAsset(conversationId,item,blob,{...state});
+          await store.putAsset(conversationId,item,copied.blob,{...state}); writtenBytes += item.size;
+          const after = await storageEstimate(getStorageEstimate); checkAbort(signal);
+          checkStorageGrowth(baseline,after,writtenBytes);
         }
         bytesDone += item.size; state.assetsCompleted = i + 1;
         onProgress({phase:'saving',name:state.name,assetIndex:i + 1,totalAssets:manifest.assets.length,bytesDone,totalBytes:manifest.totalBytes});
